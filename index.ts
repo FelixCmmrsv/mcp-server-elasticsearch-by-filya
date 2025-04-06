@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+// TEST CONFIGURATION
+let cachedIndices: Array<any> | null = null;
+let cacheTimestamp: number | null = null;
+const CACHE_DURATION = 600_000; // 10 min in ms
+
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client, estypes, ClientOptions } from "@elastic/elasticsearch";
@@ -91,50 +96,59 @@ export async function createElasticsearchMcpServer(
   // Tool 1: List indices
   server.tool(
     "list_indices",
-    "List all available Elasticsearch indices",
+    "List all available Elasticsearch indices (cached)",
     {},
     async () => {
-      try {
-        const response = await esClient.cat.indices({ format: "json" });
+    const now = Date.now();
 
-        const indicesInfo = response.map((index) => ({
-          index: index.index,
-          health: index.health,
-          status: index.status,
-          docsCount: index.docsCount,
-        }));
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Found ${indicesInfo.length} indices`,
-            },
-            {
-              type: "text" as const,
-              text: JSON.stringify(indicesInfo, null, 2),
-            },
-          ],
-        };
-      } catch (error) {
-        console.error(
-          `Failed to list indices: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            },
-          ],
-        };
-      }
+    // Проверка валидности кеша
+    if (cachedIndices && cacheTimestamp && now - cacheTimestamp < CACHE_DURATION) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${cachedIndices.length} indices (cached)`,
+          },
+          {
+            type: "text",
+            text: JSON.stringify(cachedIndices, null, 2),
+          },
+        ],
+      };
     }
-  );
+
+    try {
+      const response = await esClient.cat.indices({ format: "json" });
+
+      cachedIndices = response.map((index) => ({
+        index: index.index,
+        health: index.health,
+        status: index.status,
+        docsCount: index.docsCount,
+      }));
+
+      cacheTimestamp = now;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${cachedIndices.length} indices`,
+          },
+          {
+            type: "text",
+            text: JSON.stringify(cachedIndices, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      console.error(`Failed to list indices: ${error}`);
+      return {
+        content: [{ type: "text", text: `Error: ${error}` }],
+      };
+    }
+  }
+);
 
   // Tool 2: Get mappings for an index
   server.tool(
@@ -190,130 +204,62 @@ export async function createElasticsearchMcpServer(
   );
 
   // Tool 3: Search an index with simplified parameters
-  server.tool(
-    "search",
-    "Perform an Elasticsearch search with the provided query DSL. Highlights are always enabled.",
-    {
-      index: z
-        .string()
-        .trim()
-        .min(1, "Index name is required")
-        .describe("Name of the Elasticsearch index to search"),
+  // Изменённый search tool с явным указанием индекса
+server.tool(
+  "search",
+  "Perform Elasticsearch search on a specified index. User must provide exact index name explicitly.",
+  {
+    index: z
+      .string()
+      .trim()
+      .min(1, "Exact index name is required.")
+      .describe("Explicit Elasticsearch index name"),
 
-      queryBody: z
-        .record(z.any())
-        .refine(
-          (val) => {
-            try {
-              JSON.parse(JSON.stringify(val));
-              return true;
-            } catch (e) {
-              return false;
-            }
-          },
-          {
-            message: "queryBody must be a valid Elasticsearch query DSL object",
-          }
-        )
-        .describe(
-          "Complete Elasticsearch query DSL object that can include query, size, from, sort, etc."
-        ),
-    },
-    async ({ index, queryBody }) => {
-      try {
-        // Get mappings to identify text fields for highlighting
-        const mappingResponse = await esClient.indices.getMapping({
-          index,
-        });
-
-        const indexMappings = mappingResponse[index]?.mappings || {};
-
-        const searchRequest: estypes.SearchRequest = {
-          index,
-          ...queryBody,
-        };
-
-        // Always do highlighting
-        if (indexMappings.properties) {
-          const textFields: Record<string, estypes.SearchHighlightField> = {};
-
-          for (const [fieldName, fieldData] of Object.entries(
-            indexMappings.properties
-          )) {
-            if (fieldData.type === "text" || "dense_vector" in fieldData) {
-              textFields[fieldName] = {};
-            }
-          }
-
-          searchRequest.highlight = {
-            fields: textFields,
-            pre_tags: ["<em>"],
-            post_tags: ["</em>"],
-          };
+    queryBody: z
+      .record(z.any())
+      .refine((val) => {
+        try {
+          JSON.parse(JSON.stringify(val));
+          return true;
+        } catch {
+          return false;
         }
+      }, { message: "queryBody must be a valid Elasticsearch query DSL object" })
+      .describe("Elasticsearch query DSL object."),
+  },
+  async ({ index, queryBody }) => {
+    try {
+      const searchRequest: estypes.SearchRequest = {
+        index,
+        ...queryBody,
+        highlight: { fields: { "*": {} } },
+      };
 
-        const result = await esClient.search(searchRequest);
+      const result = await esClient.search(searchRequest);
+      const from = queryBody.from || 0;
 
-        // Extract the 'from' parameter from queryBody, defaulting to 0 if not provided
-        const from = queryBody.from || 0;
+      const contentFragments = result.hits.hits.map((hit) => ({
+        type: "text",
+        text: JSON.stringify(hit._source, null, 2),
+      }));
 
-        const contentFragments = result.hits.hits.map((hit) => {
-          const highlightedFields = hit.highlight || {};
-          const sourceData = hit._source || {};
+      const metadataFragment = {
+        type: "text",
+        text: `Total results: ${
+          typeof result.hits.total === "number"
+            ? result.hits.total
+            : result.hits.total?.value || 0
+        }, showing ${result.hits.hits.length} from position ${from}`,
+      };
 
-          let content = "";
-
-          for (const [field, highlights] of Object.entries(highlightedFields)) {
-            if (highlights && highlights.length > 0) {
-              content += `${field} (highlighted): ${highlights.join(
-                " ... "
-              )}\n`;
-            }
-          }
-
-          for (const [field, value] of Object.entries(sourceData)) {
-            if (!(field in highlightedFields)) {
-              content += `${field}: ${JSON.stringify(value)}\n`;
-            }
-          }
-
-          return {
-            type: "text" as const,
-            text: content.trim(),
-          };
-        });
-
-        const metadataFragment = {
-          type: "text" as const,
-          text: `Total results: ${
-            typeof result.hits.total === "number"
-              ? result.hits.total
-              : result.hits.total?.value || 0
-          }, showing ${result.hits.hits.length} from position ${from}`,
-        };
-
-        return {
-          content: [metadataFragment, ...contentFragments],
-        };
-      } catch (error) {
-        console.error(
-          `Search failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            },
-          ],
-        };
-      }
+      return { content: [metadataFragment, ...contentFragments] };
+    } catch (error) {
+      console.error(`Search failed: ${error}`);
+      return { content: [{ type: "text", text: `Error: ${error}` }] };
     }
-  );
+  }
+);
+
 
   return server;
 }
