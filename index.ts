@@ -239,12 +239,12 @@ server.tool(
       const from = queryBody.from || 0;
 
       const contentFragments = result.hits.hits.map((hit) => ({
-        type: "text",
+        type: "text" as const, // <-- Исправление здесь
         text: JSON.stringify(hit._source, null, 2),
       }));
 
       const metadataFragment = {
-        type: "text",
+        type: "text" as const, // <-- Исправление здесь
         text: `Total results: ${
           typeof result.hits.total === "number"
             ? result.hits.total
@@ -255,11 +255,10 @@ server.tool(
       return { content: [metadataFragment, ...contentFragments] };
     } catch (error) {
       console.error(`Search failed: ${error}`);
-      return { content: [{ type: "text", text: `Error: ${error}` }] };
+      return { content: [{ type: "text" as const, text: `Error: ${error}` }] }; // <-- Исправление здесь
     }
   }
 );
-
 
   return server;
 }
